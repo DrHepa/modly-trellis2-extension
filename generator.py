@@ -4,23 +4,23 @@ TRELLIS.2 extension for Modly.
 Reference : https://huggingface.co/microsoft/TRELLIS.2-4B
 GitHub    : https://github.com/microsoft/TRELLIS.2
 
-All runtime pure-Python dependencies (easydict, plyfile, einops, trellis2
-source) are bundled in vendor/ — no pip install, no internet required at
-runtime.
+All pure-Python TRELLIS.2 sources used by the extension are bundled in vendor/.
+Native/runtime dependencies are expected to be installed by setup.py into the
+extension venv before Modly starts the generator subprocess.
 
-The following compiled CUDA extensions must be pre-installed in the app's venv
-(they have C++/CUDA components and cannot be vendored as pure Python):
+The following compiled/runtime dependencies must be available in the extension
+venv (installed by setup.py):
     o-voxel        — core O-Voxel representation library
     nvdiffrast     — differentiable rasterizer (NVlabs)
     nvdiffrec      — PBR renderer (JeffreyXiang fork)
     cumesh         — CUDA mesh utilities
-    flexgemm       — Triton sparse convolution
-    flash-attn     — fused attention (or: xformers as fallback)
+    xformers / flash-attn — sparse attention backend
 
 To rebuild vendor/:
     python build_vendor.py   (run once with the app's venv active)
 """
 
+import importlib.util
 import io
 import os
 import sys
@@ -176,10 +176,14 @@ class Trellis2Generator(BaseGenerator):
         # this, Windows cannot find them even if the path is correct.
         import torch  # noqa: F401
 
-        # Install large packages that cannot be vendored in git (pre-built wheels,
-        # no compilation required — just a pip download).
-        self._ensure_spconv(torch)
-        self._ensure_opencv()
+        self._require_runtime_dependency("spconv", "spconv")
+        self._require_runtime_dependency("cv2", "opencv-python-headless")
+
+        if importlib.util.find_spec("xformers") is None and importlib.util.find_spec("flash_attn") is None:
+            raise RuntimeError(
+                "[Trellis2Generator] Missing attention backend in extension venv. "
+                "Install xformers or flash-attn from setup.py."
+            )
 
         vendor_str = str(_VENDOR_DIR)
         if vendor_str not in sys.path:
@@ -193,55 +197,14 @@ class Trellis2Generator(BaseGenerator):
                 "Re-run 'python build_vendor.py' to rebuild it."
             ) from exc
 
-    def _ensure_spconv(self, torch) -> None:
-        """Install spconv via pip if not already available (pre-built wheel, no compilation)."""
-        try:
-            import spconv  # noqa: F401
+    def _require_runtime_dependency(self, module_name: str, package_name: str) -> None:
+        if importlib.util.find_spec(module_name) is not None:
             return
-        except (ImportError, OSError):
-            pass
 
-        cuda_tag = "cu" + torch.version.cuda.replace(".", "")
-        fallbacks = [cuda_tag, "cu124", "cu122", "cu121", "cu120", "cu118"]
-        seen = []
-        for tag in fallbacks:
-            if tag in seen:
-                continue
-            seen.append(tag)
-            pkg = f"spconv-{tag}"
-            print(f"[Trellis2Generator] Installing {pkg} via pip...")
-            import subprocess
-            result = subprocess.run(
-                [sys.executable, "-m", "pip", "install", pkg],
-                capture_output=True, text=True
-            )
-            if result.returncode == 0:
-                print(f"[Trellis2Generator] {pkg} installed successfully.")
-                return
         raise RuntimeError(
-            "[Trellis2Generator] Could not install spconv for any CUDA version. "
-            f"Tried: {seen}"
+            f"[Trellis2Generator] Missing runtime dependency '{module_name}' in the extension venv. "
+            f"Reinstall the extension so setup.py can install '{package_name}'."
         )
-
-    def _ensure_opencv(self) -> None:
-        """Install opencv-python via pip if not already available (pre-built wheel)."""
-        try:
-            import cv2  # noqa: F401
-            return
-        except (ImportError, OSError):
-            pass
-
-        print("[Trellis2Generator] Installing opencv-python via pip...")
-        import subprocess
-        result = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "opencv-python"],
-            capture_output=True, text=True
-        )
-        if result.returncode != 0:
-            raise RuntimeError(
-                "[Trellis2Generator] Failed to install opencv-python:\n" + result.stderr
-            )
-        print("[Trellis2Generator] opencv-python installed successfully.")
 
     def _setup_env(self) -> None:
         """Set environment variables required by TRELLIS.2 before first import."""
@@ -249,6 +212,9 @@ class Trellis2Generator(BaseGenerator):
         os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
         # flex_gemm is not available on PyPI — use spconv as conv backend instead.
         os.environ.setdefault("SPARSE_CONV_BACKEND", "spconv")
+        if importlib.util.find_spec("xformers") is not None:
+            os.environ.setdefault("ATTN_BACKEND", "xformers")
+            os.environ.setdefault("SPARSE_ATTN_BACKEND", "xformers")
 
     # ------------------------------------------------------------------ #
     # UI schema
