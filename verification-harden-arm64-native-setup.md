@@ -1,0 +1,11 @@
+# Harden ARM64 Native Setup Verification Checklist
+
+- `python3 setup.py --dry-run-plan` shows the resolved platform plan without building anything.
+- `python3 validate_harden_arm64_native_setup.py` runs the project-owned lightweight validation suite for install-plan selection, fallback ordering, pinned native refs, optional `nvdiffrec`, and vendor `nvdiffrast` guards.
+- Linux ARM64 should report `flash_attn` first and `spconv_strategy: source`.
+- Non-ARM64 should keep the existing `xformers`-first order, with `flash_attn` fallback only where previously supported.
+- `nvdiffrec` is deferred on Linux ARM64 by default; other platforms keep the current auto-attempt but no longer block core setup if the optional renderer install fails. Set `MODLY_TRELLIS2_INSTALL_NVDIFFREC=1` to force the optional renderer install.
+- `CuMesh` is pinned to `cf1a2f07304b5fe388ed86a16e4a0474599df914` in `setup.py`; update only after validating a new immutable ref.
+- `o-voxel` installs from TRELLIS.2 using `--no-deps`, with explicit support packages `plyfile` and `zstandard` installed separately.
+- Expected native install failures now mention the package name, platform, attempted ref/version, and toolchain checks (`CUDA`, `nvcc`, compiler, torch/CUDA compatibility).
+- `generator.py` must keep vendor imports available while ensuring `nvdiffrast` resolves from the extension venv, not `vendor/`, and it must fail fast if `vendor/nvdiffrast` reappears.

@@ -8,13 +8,16 @@ All pure-Python TRELLIS.2 sources used by the extension are bundled in vendor/.
 Native/runtime dependencies are expected to be installed by setup.py into the
 extension venv before Modly starts the generator subprocess.
 
-The following compiled/runtime dependencies must be available in the extension
+The following core runtime dependencies must be available in the extension
 venv (installed by setup.py):
     o-voxel        — core O-Voxel representation library
     nvdiffrast     — differentiable rasterizer (NVlabs)
-    nvdiffrec      — PBR renderer (JeffreyXiang fork)
     cumesh         — CUDA mesh utilities
     xformers / flash-attn — sparse attention backend
+    spconv         — sparse convolution backend
+
+Optional renderer dependency:
+    nvdiffrec      — deferred renderer stack used only by optional rendering paths
 
 To rebuild vendor/:
     python build_vendor.py   (run once with the app's venv active)
@@ -36,6 +39,24 @@ from services.generators.base import BaseGenerator, smooth_progress, GenerationC
 
 _EXTENSION_DIR = Path(__file__).parent
 _VENDOR_DIR    = _EXTENSION_DIR / "vendor"
+_OPTIONAL_NVDIFFREC_ENV = "MODLY_TRELLIS2_INSTALL_NVDIFFREC"
+_NATIVE_VENDOR_OVERLAPS = {"nvdiffrast"}
+
+
+def filtered_vendor_paths() -> list[str]:
+    ignored = sorted(name for name in _NATIVE_VENDOR_OVERLAPS if (_VENDOR_DIR / name).exists())
+    if ignored:
+        raise RuntimeError(
+            "[Trellis2Generator] Vendored native overlap directories are not allowed: "
+            + ", ".join(ignored)
+            + ". Remove them from vendor/ so native packages resolve only from the extension venv."
+        )
+    return [str(_VENDOR_DIR)]
+
+
+def module_spec_origin(module_name: str) -> str | None:
+    spec = importlib.util.find_spec(module_name)
+    return getattr(spec, "origin", None) if spec is not None else None
 
 
 class Trellis2Generator(BaseGenerator):
@@ -136,21 +157,30 @@ class Trellis2Generator(BaseGenerator):
 
         # Bake PBR textures and export GLB
         self._report(progress_cb, 93, "Baking textures & exporting GLB...")
-        glb = o_voxel.postprocess.to_glb(
-            vertices          = mesh.vertices,
-            faces             = mesh.faces,
-            attr_volume       = mesh.attrs,
-            coords            = mesh.coords,
-            attr_layout       = mesh.layout,
-            voxel_size        = mesh.voxel_size,
-            aabb              = [[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
-            decimation_target = target_faces,
-            texture_size      = texture_size,
-            remesh            = True,
-            remesh_band       = 1,
-            remesh_project    = 0,
-            verbose           = False,
-        )
+        try:
+            glb = o_voxel.postprocess.to_glb(
+                vertices          = mesh.vertices,
+                faces             = mesh.faces,
+                attr_volume       = mesh.attrs,
+                coords            = mesh.coords,
+                attr_layout       = mesh.layout,
+                voxel_size        = mesh.voxel_size,
+                aabb              = [[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
+                decimation_target = target_faces,
+                texture_size      = texture_size,
+                remesh            = True,
+                remesh_band       = 1,
+                remesh_project    = 0,
+                verbose           = False,
+            )
+        except ModuleNotFoundError as exc:
+            if exc.name in {"nvdiffrec", "nvdiffrec_render"}:
+                raise RuntimeError(
+                    "[Trellis2Generator] Optional renderer dependency 'nvdiffrec' is not installed in the extension venv. "
+                    f"Core setup intentionally skips it by default. Re-run setup with {_OPTIONAL_NVDIFFREC_ENV}=1 "
+                    "if this renderer path is required."
+                ) from exc
+            raise
 
         self.outputs_dir.mkdir(parents=True, exist_ok=True)
         name = f"{int(time.time())}_{uuid.uuid4().hex[:8]}.glb"
@@ -178,6 +208,9 @@ class Trellis2Generator(BaseGenerator):
 
         self._require_runtime_dependency("spconv", "spconv")
         self._require_runtime_dependency("cv2", "opencv-python-headless")
+        self._require_runtime_dependency("o_voxel", "o-voxel")
+        self._require_runtime_dependency("cumesh", "CuMesh")
+        self._require_runtime_dependency("nvdiffrast", "nvdiffrast", allow_vendor=False)
 
         if importlib.util.find_spec("xformers") is None and importlib.util.find_spec("flash_attn") is None:
             raise RuntimeError(
@@ -185,9 +218,16 @@ class Trellis2Generator(BaseGenerator):
                 "Install xformers or flash-attn from setup.py."
             )
 
-        vendor_str = str(_VENDOR_DIR)
-        if vendor_str not in sys.path:
-            sys.path.insert(0, vendor_str)
+        for vendor_path in filtered_vendor_paths():
+            if vendor_path not in sys.path:
+                sys.path.append(vendor_path)
+
+        nvdiffrast_origin = module_spec_origin("nvdiffrast")
+        if nvdiffrast_origin and str(_VENDOR_DIR) in nvdiffrast_origin:
+            raise RuntimeError(
+                "[Trellis2Generator] nvdiffrast resolved from vendor/ instead of the extension venv. "
+                "Remove the vendored overlap and reinstall the extension."
+            )
 
         try:
             from trellis2.pipelines import Trellis2ImageTo3DPipeline  # noqa: F401
@@ -197,8 +237,14 @@ class Trellis2Generator(BaseGenerator):
                 "Re-run 'python build_vendor.py' to rebuild it."
             ) from exc
 
-    def _require_runtime_dependency(self, module_name: str, package_name: str) -> None:
-        if importlib.util.find_spec(module_name) is not None:
+    def _require_runtime_dependency(self, module_name: str, package_name: str, *, allow_vendor: bool = True) -> None:
+        origin = module_spec_origin(module_name)
+        if origin is not None:
+            if not allow_vendor and str(_VENDOR_DIR) in origin:
+                raise RuntimeError(
+                    f"[Trellis2Generator] Runtime dependency '{module_name}' resolved from vendor/ instead of the extension venv. "
+                    f"Reinstall the extension so setup.py can install '{package_name}' into the venv."
+                )
             return
 
         raise RuntimeError(
@@ -215,6 +261,9 @@ class Trellis2Generator(BaseGenerator):
         if importlib.util.find_spec("xformers") is not None:
             os.environ.setdefault("ATTN_BACKEND", "xformers")
             os.environ.setdefault("SPARSE_ATTN_BACKEND", "xformers")
+        elif importlib.util.find_spec("flash_attn") is not None:
+            os.environ.setdefault("ATTN_BACKEND", "flash_attn")
+            os.environ.setdefault("SPARSE_ATTN_BACKEND", "flash_attn")
 
     # ------------------------------------------------------------------ #
     # UI schema
