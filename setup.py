@@ -40,6 +40,36 @@ TRELLIS2_SOURCE_REF = "5565d240c4a494caaf9ece7a554542b76ffa36d3"
 O_VOXEL_SUBDIRECTORY = "o-voxel"
 O_VOXEL_SUPPORT_PACKAGES = ("plyfile", "zstandard")
 OPTIONAL_NVDIFFREC_ENV = "MODLY_TRELLIS2_INSTALL_NVDIFFREC"
+CUMM_CUDA_DISCOVERY_PATCH_MARKER = "modly_trellis2_cuda_root_override"
+CUMM_SUPPORTED_CUDA_ARCHES = frozenset(
+    {
+        "5.2",
+        "6.0",
+        "6.1",
+        "7.0",
+        "7.2",
+        "7.5",
+        "8.0",
+        "8.6",
+        "8.7",
+        "8.9",
+        "9.0",
+        "5.2+PTX",
+        "6.0+PTX",
+        "6.1+PTX",
+        "7.0+PTX",
+        "7.2+PTX",
+        "7.5+PTX",
+        "8.0+PTX",
+        "8.6+PTX",
+        "8.7+PTX",
+        "8.9+PTX",
+        "9.0+PTX",
+    }
+)
+CUMM_MAX_SUPPORTED_SM = 90
+CUMM_MAX_SUPPORTED_ARCH = "9.0"
+CUMM_FORWARD_COMPAT_ARCH = "9.0+PTX"
 
 
 @dataclass(frozen=True)
@@ -69,11 +99,25 @@ def is_linux_arm64() -> bool:
     return is_linux() and machine_arch() in {"aarch64", "arm64"}
 
 
-def cuda_arch_list_from_sm(gpu_sm: int) -> str | None:
+def cuda_arch_string_from_sm(gpu_sm: int) -> str | None:
     if gpu_sm <= 0:
         return None
     major, minor = divmod(gpu_sm, 10)
     return f"{major}.{minor}"
+
+
+def resolve_cumm_cuda_arch(gpu_sm: int) -> tuple[str | None, str]:
+    requested_arch = cuda_arch_string_from_sm(gpu_sm)
+    if requested_arch is None:
+        return None, "gpu_sm was not provided; upstream CUDA arch autodetection will be used"
+    if requested_arch in CUMM_SUPPORTED_CUDA_ARCHES:
+        return requested_arch, f"SM {gpu_sm} maps directly to supported cumm arch {requested_arch}"
+    if gpu_sm > CUMM_MAX_SUPPORTED_SM:
+        return (
+            CUMM_FORWARD_COMPAT_ARCH,
+            f"SM {gpu_sm} maps to unsupported arch {requested_arch}; clamping to {CUMM_FORWARD_COMPAT_ARCH} because cumm {CUMM_SOURCE_REF} supports up to {CUMM_MAX_SUPPORTED_ARCH} and PTX enables forward compatibility",
+        )
+    return requested_arch, f"SM {gpu_sm} maps to arch {requested_arch}; no compatibility remap applied"
 
 
 def plan_platform_install() -> PlatformInstallPlan:
@@ -97,16 +141,34 @@ def plan_platform_install() -> PlatformInstallPlan:
 def describe_install_plan(gpu_sm: int, cuda_version: int) -> dict[str, object]:
     torch_pkgs, torch_index, cuda_tag = select_torch(gpu_sm, cuda_version)
     plan = plan_platform_install()
-    return {
+    attention_backend_install_args = {
+        backend: (["--no-build-isolation"] if attention_backend_needs_no_build_isolation(backend, requirement) else [])
+        for backend, requirement in plan.attention_backends
+    }
+    description = {
         "platform": platform_label(),
         "plan": plan.name,
         "spconv_strategy": "source" if is_linux_arm64() else "prebuilt",
         "attention_backends": [backend for backend, _ in plan.attention_backends],
+        "attention_backend_install_args": attention_backend_install_args,
         "torch_packages": torch_pkgs,
         "torch_index": torch_index,
         "cuda_tag": cuda_tag,
         "optional_renderer_default": plan.optional_renderer_default,
     }
+    if is_linux_arm64():
+        _, source_build_diagnostics = source_build_env_overrides(gpu_sm=gpu_sm, cuda_version=cuda_version)
+        description["source_build_env"] = {
+            key: value for key, value in source_build_diagnostics.items() if key != "cumm_cuda_arch"
+        }
+        if description["source_build_env"].get("PATH"):
+            description["source_build_env"]["PATH"] = (
+                f"<extension-venv-bin>{os.pathsep}{description['source_build_env']['PATH']}"
+            )
+        else:
+            description["source_build_env"]["PATH"] = f"<extension-venv-bin>{os.pathsep}${{PATH}}"
+        description["cumm_cuda_arch"] = source_build_diagnostics["cumm_cuda_arch"]
+    return description
 
 
 def venv_bin(venv: Path, name: str) -> Path:
@@ -116,6 +178,172 @@ def venv_bin(venv: Path, name: str) -> Path:
     return venv / "bin" / name
 
 
+def prepend_directory_to_path(env: dict[str, str], directory: Path) -> dict[str, str]:
+    updated_env = env.copy()
+    directory_str = str(directory)
+    existing_parts = [part for part in updated_env.get("PATH", "").split(os.pathsep) if part]
+    updated_env["PATH"] = os.pathsep.join([directory_str, *[part for part in existing_parts if part != directory_str]])
+    return updated_env
+
+
+def prepend_env_path(env: dict[str, str], key: str, *entries: Path) -> None:
+    values = [str(entry) for entry in entries if str(entry)]
+    if not values:
+        return
+    existing_parts = [part for part in env.get(key, "").split(os.pathsep) if part]
+    env[key] = os.pathsep.join([*values, *[part for part in existing_parts if part not in values]])
+
+
+def cuda_version_to_toolkit_version(cuda_version: int) -> str | None:
+    if cuda_version <= 0:
+        return None
+    major, minor = divmod(cuda_version, 10)
+    return f"{major}.{minor}"
+
+
+def candidate_cuda_toolkit_roots(cuda_version: int, env: dict[str, str] | None = None) -> list[Path]:
+    source_env = env or os.environ
+    candidates: list[Path] = []
+    for key in ("MODLY_TRELLIS2_CUDA_TOOLKIT_ROOT", "CUDA_HOME", "CUDA_PATH"):
+        raw_value = source_env.get(key)
+        if raw_value:
+            candidates.append(Path(raw_value).expanduser())
+
+    toolkit_version = cuda_version_to_toolkit_version(cuda_version)
+    if toolkit_version:
+        candidates.append(Path(f"/usr/local/cuda-{toolkit_version}"))
+    candidates.append(Path("/usr/local/cuda"))
+
+    deduped: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        normalized = str(candidate)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(candidate)
+    return deduped
+
+
+def resolve_cuda_toolkit_root(cuda_version: int, env: dict[str, str] | None = None) -> Path | None:
+    for candidate in candidate_cuda_toolkit_roots(cuda_version, env=env):
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def cuda_toolkit_library_dirs(toolkit_root: Path) -> tuple[Path, ...]:
+    candidates = [toolkit_root / "lib64"]
+    if is_linux_arm64():
+        candidates.extend(
+            [
+                toolkit_root / "targets" / "aarch64-linux" / "lib",
+                toolkit_root / "targets" / "sbsa-linux" / "lib",
+            ]
+        )
+    elif is_linux():
+        candidates.append(toolkit_root / "targets" / "x86_64-linux" / "lib")
+    return tuple(path for path in candidates if path.exists())
+
+
+def source_build_env_overrides(
+    *,
+    gpu_sm: int,
+    cuda_version: int,
+    build_env: dict[str, str] | None = None,
+    venv: Path | None = None,
+) -> tuple[dict[str, str], dict[str, object]]:
+    source_env = dict(build_env or os.environ)
+    venv_bin_dir: Path | None = None
+    diagnostics: dict[str, object] = {
+        "CUMM_DISABLE_JIT": "1",
+        "SPCONV_DISABLE_JIT": "1",
+    }
+    source_env.setdefault("CUMM_DISABLE_JIT", "1")
+    source_env.setdefault("SPCONV_DISABLE_JIT", "1")
+
+    requested_arch = cuda_arch_string_from_sm(gpu_sm)
+    cuda_arch, arch_reason = resolve_cumm_cuda_arch(gpu_sm)
+    diagnostics["cumm_cuda_arch"] = {
+        "requested": requested_arch,
+        "resolved": cuda_arch,
+        "reason": arch_reason,
+    }
+    if cuda_arch:
+        source_env.setdefault("CUMM_CUDA_ARCH_LIST", cuda_arch)
+        diagnostics["CUMM_CUDA_ARCH_LIST"] = source_env["CUMM_CUDA_ARCH_LIST"]
+
+    if venv is not None:
+        venv_bin_dir = venv_bin(venv, "python").parent
+        source_env = prepend_directory_to_path(source_env, venv_bin_dir)
+        diagnostics["PATH"] = f"<extension-venv-bin>{os.pathsep}${{PATH}}"
+
+    toolkit_root = resolve_cuda_toolkit_root(cuda_version, env=source_env)
+    diagnostics["cuda_toolkit_root_candidates"] = [str(path) for path in candidate_cuda_toolkit_roots(cuda_version, env=source_env)]
+    if toolkit_root is None:
+        diagnostics["cuda_toolkit_root"] = None
+        return source_env, diagnostics
+
+    source_env["CUDA_HOME"] = str(toolkit_root)
+    source_env["CUDA_PATH"] = str(toolkit_root)
+    source_env["CUDACXX"] = str(toolkit_root / "bin" / "nvcc")
+    if venv_bin_dir is not None:
+        prepend_env_path(source_env, "PATH", venv_bin_dir, toolkit_root / "bin")
+    else:
+        prepend_env_path(source_env, "PATH", toolkit_root / "bin")
+
+    include_dir = toolkit_root / "include"
+    prepend_env_path(source_env, "CPATH", include_dir)
+    prepend_env_path(source_env, "C_INCLUDE_PATH", include_dir)
+    prepend_env_path(source_env, "CPLUS_INCLUDE_PATH", include_dir)
+
+    library_dirs = cuda_toolkit_library_dirs(toolkit_root)
+    if library_dirs:
+        prepend_env_path(source_env, "LIBRARY_PATH", *library_dirs)
+        prepend_env_path(source_env, "LD_LIBRARY_PATH", *library_dirs)
+
+    diagnostics["cuda_toolkit_root"] = str(toolkit_root)
+    diagnostics["CUDA_HOME"] = source_env["CUDA_HOME"]
+    diagnostics["CUDA_PATH"] = source_env["CUDA_PATH"]
+    diagnostics["CUDACXX"] = source_env["CUDACXX"]
+    diagnostics["PATH"] = (
+        f"<extension-venv-bin>{os.pathsep}{toolkit_root / 'bin'}{os.pathsep}${{PATH}}"
+        if venv is not None
+        else f"{toolkit_root / 'bin'}{os.pathsep}${{PATH}}"
+    )
+    diagnostics["CPATH"] = f"{include_dir}{os.pathsep}${{CPATH}}"
+    diagnostics["C_INCLUDE_PATH"] = f"{include_dir}{os.pathsep}${{C_INCLUDE_PATH}}"
+    diagnostics["CPLUS_INCLUDE_PATH"] = f"{include_dir}{os.pathsep}${{CPLUS_INCLUDE_PATH}}"
+    if library_dirs:
+        joined_libs = os.pathsep.join(str(path) for path in library_dirs)
+        diagnostics["LIBRARY_PATH"] = f"{joined_libs}{os.pathsep}${{LIBRARY_PATH}}"
+        diagnostics["LD_LIBRARY_PATH"] = f"{joined_libs}{os.pathsep}${{LD_LIBRARY_PATH}}"
+    diagnostics["source_build_hotfixes"] = [
+        "patch installed cumm/common.py on Linux ARM64 so CUDA include/lib discovery honors CUDA_HOME/CUDA_PATH before /usr/local/cuda"
+    ]
+    return source_env, diagnostics
+
+
+def patch_installed_cumm_cuda_discovery(venv: Path) -> None:
+    cumm_common = Path(
+        subprocess.check_output(
+            [str(venv_bin(venv, "python")), "-c", "import cumm.common; print(cumm.common.__file__)"],
+            text=True,
+        ).strip()
+    )
+    original = cumm_common.read_text()
+    if CUMM_CUDA_DISCOVERY_PATCH_MARKER in original:
+        print(f"[setup] cumm CUDA discovery patch already present at {cumm_common}")
+        return
+
+    old = """        else:\n            try:\n                nvcc_path = subprocess.check_output([\"which\", \"nvcc\"\n                                                    ]).decode(\"utf-8\").strip()\n                lib = Path(nvcc_path).parent.parent / \"lib\"\n                include = Path(nvcc_path).parent.parent / \"targets/x86_64-linux/include\"\n                if lib.exists() and include.exists():\n                    if (lib / \"libcudart.so\").exists() and (include / \"cuda.h\").exists():\n                        # should be nvidia conda package\n                        _CACHED_CUDA_INCLUDE_LIB = ([include], lib)\n                        return _CACHED_CUDA_INCLUDE_LIB\n            except:\n                pass \n\n            linux_cuda_root = Path(\"/usr/local/cuda\")\n            include = linux_cuda_root / f\"include\"\n            lib64 = linux_cuda_root / f\"lib64\"\n            assert linux_cuda_root.exists(), f\"can't find cuda in {linux_cuda_root} install via cuda installer or conda first.\"\n"""
+    new = """        else:\n            try:\n                nvcc_path = subprocess.check_output([\"which\", \"nvcc\"\n                                                    ]).decode(\"utf-8\").strip()\n                linux_cuda_root = Path(nvcc_path).parent.parent\n                include_candidates = [\n                    linux_cuda_root / \"targets/x86_64-linux/include\",\n                    linux_cuda_root / \"targets/aarch64-linux/include\",\n                    linux_cuda_root / \"targets/sbsa-linux/include\",\n                    linux_cuda_root / \"include\",\n                ]\n                lib_candidates = [\n                    linux_cuda_root / \"lib\",\n                    linux_cuda_root / \"lib64\",\n                    linux_cuda_root / \"targets/x86_64-linux/lib\",\n                    linux_cuda_root / \"targets/aarch64-linux/lib\",\n                    linux_cuda_root / \"targets/sbsa-linux/lib\",\n                ]\n                for include in include_candidates:\n                    for lib in lib_candidates:\n                        if (lib / \"libcudart.so\").exists() and (include / \"cuda.h\").exists():\n                            # should be nvidia conda package or an explicitly selected toolkit root\n                            _CACHED_CUDA_INCLUDE_LIB = ([include], lib)\n                            return _CACHED_CUDA_INCLUDE_LIB\n            except:\n                pass \n\n            linux_cuda_roots = []\n            for env_name in (\"CUDA_HOME\", \"CUDA_PATH\"):\n                env_value = os.getenv(env_name)\n                if env_value:\n                    linux_cuda_roots.append(Path(env_value))\n            linux_cuda_roots.append(Path(\"/usr/local/cuda\"))\n            for linux_cuda_root in linux_cuda_roots:\n                include_candidates = [\n                    linux_cuda_root / \"include\",\n                    linux_cuda_root / \"targets/x86_64-linux/include\",\n                    linux_cuda_root / \"targets/aarch64-linux/include\",\n                    linux_cuda_root / \"targets/sbsa-linux/include\",\n                ]\n                lib_candidates = [\n                    linux_cuda_root / \"lib64\",\n                    linux_cuda_root / \"lib\",\n                    linux_cuda_root / \"targets/x86_64-linux/lib\",\n                    linux_cuda_root / \"targets/aarch64-linux/lib\",\n                    linux_cuda_root / \"targets/sbsa-linux/lib\",\n                ]\n                for include in include_candidates:\n                    for lib64 in lib_candidates:\n                        if (lib64 / \"libcudart.so\").exists() and (include / \"cuda.h\").exists():\n                            # modly_trellis2_cuda_root_override: honor explicit CUDA root on Linux ARM64 before /usr/local/cuda\n                            _CACHED_CUDA_INCLUDE_LIB = ([include], lib64)\n                            return _CACHED_CUDA_INCLUDE_LIB\n            linux_cuda_root = Path(\"/usr/local/cuda\")\n            include = linux_cuda_root / f\"include\"\n            lib64 = linux_cuda_root / f\"lib64\"\n            assert linux_cuda_root.exists(), f\"can't find cuda in {linux_cuda_root} install via cuda installer or conda first.\"\n"""
+    if old not in original:
+        raise RuntimeError(f"Unable to patch cumm CUDA discovery at {cumm_common}; upstream layout changed.")
+    cumm_common.write_text(original.replace(old, new, 1))
+    print(f"[setup] Patched cumm CUDA discovery at {cumm_common} to honor explicit CUDA toolkit roots on Linux ARM64.")
+
+
 def run(cmd: list[str], *, env: dict[str, str] | None = None, cwd: Path | None = None) -> None:
     print("[setup] $", " ".join(str(part) for part in cmd))
     subprocess.run(cmd, check=True, env=env, cwd=str(cwd) if cwd else None)
@@ -123,6 +351,19 @@ def run(cmd: list[str], *, env: dict[str, str] | None = None, cwd: Path | None =
 
 def pip(venv: Path, *args: str, env: dict[str, str] | None = None) -> None:
     run([str(venv_bin(venv, "pip")), *args], env=env)
+
+
+def pip_install(
+    venv: Path,
+    *packages: str,
+    env: dict[str, str] | None = None,
+    no_build_isolation: bool = False,
+) -> None:
+    cmd = ["install"]
+    if no_build_isolation:
+        cmd.append("--no-build-isolation")
+    cmd.extend(packages)
+    pip(venv, *cmd, env=env)
 
 
 def python(venv: Path, *args: str, env: dict[str, str] | None = None) -> None:
@@ -178,11 +419,16 @@ def install_packages_with_diagnostics(
     attempted_ref: str,
     *packages: str,
     env: dict[str, str] | None = None,
+    no_build_isolation: bool = False,
 ) -> None:
     try:
-        pip(venv, "install", *packages, env=env)
+        pip_install(venv, *packages, env=env, no_build_isolation=no_build_isolation)
     except subprocess.CalledProcessError as exc:
         raise native_install_error(package_name, attempted_ref, exc) from exc
+
+
+def attention_backend_needs_no_build_isolation(backend_name: str, requirement: str) -> bool:
+    return is_linux_arm64() and backend_name == "flash_attn" and requirement == f"flash-attn=={FLASH_ATTN_VERSION}"
 
 
 def uninstall_packages(venv: Path, *packages: str) -> None:
@@ -227,16 +473,40 @@ def install_prebuilt_spconv(venv: Path, cuda_tag: str) -> None:
     ) from last_error
 
 
-def install_spconv_from_source(venv: Path, gpu_sm: int, build_env: dict[str, str]) -> None:
-    source_env = build_env.copy()
-    cuda_arch = cuda_arch_list_from_sm(gpu_sm)
+def install_spconv_from_source(venv: Path, gpu_sm: int, cuda_version: int, build_env: dict[str, str]) -> None:
+    source_env, source_build_diagnostics = source_build_env_overrides(
+        gpu_sm=gpu_sm,
+        cuda_version=cuda_version,
+        build_env=build_env,
+        venv=venv,
+    )
+    cumm_cuda_arch = source_build_diagnostics["cumm_cuda_arch"]
+    requested_arch = cumm_cuda_arch["requested"]
+    cuda_arch = cumm_cuda_arch["resolved"]
+    arch_reason = cumm_cuda_arch["reason"]
     if cuda_arch:
-        source_env.setdefault("CUMM_CUDA_ARCH_LIST", cuda_arch)
-        print(f"[setup] Using CUMM_CUDA_ARCH_LIST={cuda_arch} for spconv source build.")
+        print(
+            f"[setup] Resolved CUMM_CUDA_ARCH_LIST from gpu_sm={gpu_sm}: "
+            f"requested={requested_arch} resolved={cuda_arch}."
+        )
+        print(f"[setup] CUMM arch mapping reason: {arch_reason}")
     else:
-        print("[setup] gpu_sm was not provided; using upstream default CUDA arch detection for spconv build.")
+        print(f"[setup] {arch_reason}.")
 
     print("[setup] Linux ARM64 detected. Falling back to source install for cumm + spconv.")
+    print(
+        "[setup] Forcing non-JIT package builds so cumm/spconv install bundled headers and runtime assets "
+        "from the temporary source clones."
+    )
+    print(f"[setup] Source build PATH begins with: {source_env['PATH'].split(os.pathsep)[0]}")
+    if source_build_diagnostics.get("cuda_toolkit_root"):
+        print(f"[setup] Steering cumm/spconv source builds to CUDA toolkit root: {source_build_diagnostics['cuda_toolkit_root']}")
+        print(f"[setup] CUDACXX={source_env['CUDACXX']}")
+        print(f"[setup] CPATH begins with: {source_env['CPATH'].split(os.pathsep)[0]}")
+        if source_env.get("LIBRARY_PATH"):
+            print(f"[setup] LIBRARY_PATH begins with: {source_env['LIBRARY_PATH'].split(os.pathsep)[0]}")
+    else:
+        print("[setup] WARNING: no CUDA toolkit root was resolved; source builds will rely on ambient CUDA discovery.")
     uninstall_packages(venv, "spconv", "cumm")
     install_packages_with_diagnostics(
         venv,
@@ -260,6 +530,7 @@ def install_spconv_from_source(venv: Path, gpu_sm: int, build_env: dict[str, str
             env=source_env,
             no_deps=True,
         )
+        patch_installed_cumm_cuda_discovery(venv)
         install_from_repo(
             venv,
             tmpdir,
@@ -275,7 +546,8 @@ def install_spconv_from_source(venv: Path, gpu_sm: int, build_env: dict[str, str
 
 def install_spconv(venv: Path, cuda_tag: str, gpu_sm: int, build_env: dict[str, str]) -> None:
     if is_linux_arm64():
-        install_spconv_from_source(venv, gpu_sm, build_env)
+        cuda_version = int(cuda_tag[2:]) if cuda_tag.startswith("cu") else 0
+        install_spconv_from_source(venv, gpu_sm, cuda_version, build_env)
         return
 
     install_prebuilt_spconv(venv, cuda_tag)
@@ -285,7 +557,11 @@ def install_attention_backend(venv: Path, plan: PlatformInstallPlan) -> str:
     failures: list[str] = []
     for backend_name, requirement in plan.attention_backends:
         try:
-            pip(venv, "install", requirement)
+            pip_install(
+                venv,
+                requirement,
+                no_build_isolation=attention_backend_needs_no_build_isolation(backend_name, requirement),
+            )
             print(f"[setup] Installed {backend_name} attention backend.")
             return backend_name
         except subprocess.CalledProcessError as exc:
