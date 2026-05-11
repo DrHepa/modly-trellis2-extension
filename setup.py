@@ -4,6 +4,10 @@ TRELLIS.2 extension setup for Modly.
 Creates an isolated extension venv and installs the runtime dependencies needed
 by generator.py when Modly runs the extension in subprocess mode.
 
+Install success only means the local Python/native runtime is ready. First load
+still requires Hugging Face access to the gated runtime dependencies documented
+in README.md and to the TRELLIS.2 model snapshot itself.
+
 Accepted invocation forms:
 
     python setup.py '{"python_exe":"...","ext_dir":"...","gpu_sm":86,"cuda_version":124}'
@@ -577,6 +581,25 @@ def install_attention_backend(venv: Path, plan: PlatformInstallPlan) -> str:
     )
 
 
+def resolve_native_build_env(
+    venv: Path,
+    *,
+    gpu_sm: int,
+    cuda_version: int,
+    build_env: dict[str, str],
+) -> tuple[dict[str, str], dict[str, object] | None]:
+    if not is_linux_arm64():
+        return build_env, None
+
+    native_env, diagnostics = source_build_env_overrides(
+        gpu_sm=gpu_sm,
+        cuda_version=cuda_version,
+        build_env=build_env,
+        venv=venv,
+    )
+    return native_env, diagnostics
+
+
 def install_core_native_dependencies(venv: Path, tmpdir: Path, build_env: dict[str, str]) -> None:
     print("[setup] Installing core CUDA/native runtime packages ...")
     install_from_repo(
@@ -702,12 +725,29 @@ def setup(python_exe: str, ext_dir: Path, gpu_sm: int, cuda_version: int = 0) ->
     chosen_attention_backend = install_attention_backend(venv, plan)
     print(f"[setup] Selected sparse attention backend: {chosen_attention_backend}")
 
+    native_build_env, native_build_diagnostics = resolve_native_build_env(
+        venv,
+        gpu_sm=gpu_sm,
+        cuda_version=cuda_version,
+        build_env=build_env,
+    )
+    if native_build_diagnostics and native_build_diagnostics.get("cuda_toolkit_root"):
+        print(
+            "[setup] Steering native source builds (nvdiffrast/cumesh/o-voxel) to CUDA toolkit root: "
+            f"{native_build_diagnostics['cuda_toolkit_root']}"
+        )
+        print(f"[setup] Native source-build CUDACXX={native_build_env['CUDACXX']}")
+        print(f"[setup] Native source-build PATH begins with: {native_build_env['PATH'].split(os.pathsep)[0]}")
+    elif native_build_diagnostics:
+        print("[setup] WARNING: no CUDA toolkit root was resolved for native source builds; ambient CUDA discovery will be used.")
+
     with tempfile.TemporaryDirectory(prefix="trellis2-setup-") as tmp:
         tmpdir = Path(tmp)
-        install_core_native_dependencies(venv, tmpdir, build_env)
-        install_optional_native_dependencies(venv, tmpdir, build_env, plan)
+        install_core_native_dependencies(venv, tmpdir, native_build_env)
+        install_optional_native_dependencies(venv, tmpdir, native_build_env, plan)
 
     print("[setup] Done. Extension venv is ready at:", venv)
+    print("[setup] Note: first runtime load still requires Hugging Face access for gated dependencies and TRELLIS.2 weights; see README.md.")
 
 
 if __name__ == "__main__":

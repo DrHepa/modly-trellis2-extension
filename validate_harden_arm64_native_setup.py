@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import subprocess
 import sys
@@ -296,6 +297,45 @@ def test_optional_and_core_native_install_contracts() -> None:
             setup.install_optional_native_dependencies(Path("/tmp/venv"), Path("/tmp"), {}, desktop_plan)
 
 
+def test_native_build_env_steering_for_arm64_source_builds() -> None:
+    setup = load_module("modly_setup_validation_native_env", "setup.py")
+    toolkit_root = Path("/usr/local/cuda-12.8")
+    include_dir = toolkit_root / "include"
+    library_dir = toolkit_root / "lib64"
+
+    with (
+        patched_attr(setup, "is_linux_arm64", lambda: True),
+        patched_attr(setup, "resolve_cuda_toolkit_root", lambda _cuda_version, env=None: toolkit_root),
+        patched_attr(setup, "cuda_toolkit_library_dirs", lambda _toolkit_root: (library_dir,)),
+    ):
+        native_env, diagnostics = setup.resolve_native_build_env(
+            Path("/tmp/venv"),
+            gpu_sm=121,
+            cuda_version=128,
+            build_env={"CUSTOM_FLAG": "kept"},
+        )
+
+    assert_true(native_env["CUSTOM_FLAG"] == "kept", "Native ARM64 env should preserve caller build env")
+    assert_true(native_env["PATH"].split(os.pathsep)[0] == "/tmp/venv/bin", "Native ARM64 env must prepend the extension venv bin to PATH")
+    assert_true(native_env["PATH"].split(os.pathsep)[1] == str(toolkit_root / "bin"), "Native ARM64 env must keep the selected CUDA toolkit bin immediately after the extension venv bin")
+    assert_true(native_env["CUDA_HOME"] == str(toolkit_root), "Native ARM64 env must export CUDA_HOME")
+    assert_true(native_env["CUDA_PATH"] == str(toolkit_root), "Native ARM64 env must export CUDA_PATH")
+    assert_true(native_env["CUDACXX"] == str(toolkit_root / "bin" / "nvcc"), "Native ARM64 env must point CUDACXX at the selected toolkit nvcc")
+    assert_true(native_env["CPATH"].split(os.pathsep)[0] == str(include_dir), "Native ARM64 env must force the selected CUDA include path")
+    assert_true(native_env["LIBRARY_PATH"].split(os.pathsep)[0] == str(library_dir), "Native ARM64 env must force the selected CUDA library path")
+    assert_true(diagnostics is not None and diagnostics["cuda_toolkit_root"] == str(toolkit_root), "Native ARM64 diagnostics must expose the resolved toolkit root")
+
+    with patched_attr(setup, "is_linux_arm64", lambda: False):
+        passthrough_env, passthrough_diagnostics = setup.resolve_native_build_env(
+            Path("/tmp/venv"),
+            gpu_sm=121,
+            cuda_version=128,
+            build_env={"CUSTOM_FLAG": "kept"},
+        )
+    assert_true(passthrough_env == {"CUSTOM_FLAG": "kept"}, "Non-ARM64 native env resolution should be a passthrough")
+    assert_true(passthrough_diagnostics is None, "Non-ARM64 native env resolution should not emit diagnostics")
+
+
 def test_arm64_spconv_source_build_env() -> None:
     setup = load_module("modly_setup_validation_spconv", "setup.py")
     toolkit_root = Path("/usr/local/cuda-12.8")
@@ -478,12 +518,39 @@ def test_vendor_precedence_guards() -> None:
                 raise AssertionError("nvdiffrast should not be allowed to resolve from vendor/")
 
 
+def test_phase1_manifest_and_docs_contract() -> None:
+    manifest = json.loads((ROOT / "manifest.json").read_text(encoding="utf-8"))
+    nodes = manifest.get("nodes", [])
+    assert_true(len(nodes) == 1, "Phase 1 must expose exactly one runtime node")
+
+    node = nodes[0]
+    assert_true(node["id"] == "generate", "Phase 1 must preserve the working node id 'generate'")
+    assert_true(node.get("capability_id") == "image-to-mesh", "Manifest must label the current node as image-to-mesh")
+    assert_true(node.get("weight_owner_id") == "base-4b", "Manifest must declare the shared weight owner for future node expansion")
+    assert_true(node.get("input") == "image" and node.get("output") == "mesh", "Phase 1 node contract must remain image -> mesh")
+
+    with stubbed_generator_imports():
+        generator = load_module("modly_generator_phase1_validation", "generator.py")
+        assert_true(node.get("params_schema") == generator.IMAGE_TO_MESH_PARAMS_SCHEMA, "Manifest params_schema must stay aligned with generator image-to-mesh schema")
+        assert_true(generator.CAPABILITIES["generate"].capability_id == "image-to-mesh", "Generator capability map must resolve 'generate' to image-to-mesh")
+
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert_true("trellis-2/generate" in readme, "README must document the currently supported node")
+    assert_true("text-to-image -> trellis-2/generate" in readme, "README must document the workflow recommendation for prompt-first UX")
+    assert_true("https://huggingface.co/facebook/dinov3-vitl16-pretrain-lvd1689m" in readme, "README must include the gated DINOv3 dependency link")
+    assert_true("https://huggingface.co/briaai/RMBG-2.0" in readme, "README must include the gated RMBG dependency link")
+    assert_true("No native TRELLIS text-to-mesh node is exposed" in readme, "README must explicitly deny native TRELLIS text-to-mesh support for Phase 1")
+    assert_true("24 GB VRAM" in readme, "README must describe practical VRAM expectations")
+
+
 def main() -> None:
     test_setup_plan_and_attention()
     test_optional_and_core_native_install_contracts()
+    test_native_build_env_steering_for_arm64_source_builds()
     test_arm64_spconv_source_build_env()
     test_patch_installed_cumm_cuda_discovery()
     test_vendor_precedence_guards()
+    test_phase1_manifest_and_docs_contract()
     print("validate_harden_arm64_native_setup: OK")
 
 

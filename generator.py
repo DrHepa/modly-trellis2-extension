@@ -30,6 +30,7 @@ import sys
 import time
 import threading
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -41,6 +42,104 @@ _EXTENSION_DIR = Path(__file__).parent
 _VENDOR_DIR    = _EXTENSION_DIR / "vendor"
 _OPTIONAL_NVDIFFREC_ENV = "MODLY_TRELLIS2_INSTALL_NVDIFFREC"
 _NATIVE_VENDOR_OVERLAPS = {"nvdiffrast"}
+
+
+IMAGE_TO_MESH_PARAMS_SCHEMA = [
+    {
+        "id":      "pipeline_type",
+        "label":   "Resolution",
+        "type":    "select",
+        "options": [
+            {"value": "512",          "label": "512³  (~3 s)"},
+            {"value": "1024",         "label": "1024³  (~17 s)"},
+            {"value": "1024_cascade", "label": "1024³ Cascade (~17 s)"},
+            {"value": "1536_cascade", "label": "1536³ Cascade (~60 s)"},
+        ],
+        "default": "1024_cascade",
+        "tooltip": "Voxel resolution. Higher = more geometry detail but much slower and more VRAM.",
+    },
+    {
+        "id":      "sparse_steps",
+        "label":   "Sparse Structure Steps",
+        "type":    "int",
+        "default": 12,
+        "min":     1,
+        "max":     50,
+        "tooltip": "Diffusion steps for the sparse structure stage. More steps = better structure.",
+    },
+    {
+        "id":      "shape_steps",
+        "label":   "Shape SLAT Steps",
+        "type":    "int",
+        "default": 12,
+        "min":     1,
+        "max":     50,
+        "tooltip": "Diffusion steps for the shape latent stage. More steps = finer geometry.",
+    },
+    {
+        "id":      "tex_steps",
+        "label":   "Texture SLAT Steps",
+        "type":    "int",
+        "default": 12,
+        "min":     1,
+        "max":     50,
+        "tooltip": "Diffusion steps for the texture latent stage. More steps = sharper textures.",
+    },
+    {
+        "id":      "faces",
+        "label":   "Max Faces",
+        "type":    "int",
+        "default": -1,
+        "min":     -1,
+        "max":     16777216,
+        "tooltip": "Target polygon count after simplification. -1 uses 1,000,000.",
+    },
+    {
+        "id":      "texture_size",
+        "label":   "Texture Size",
+        "type":    "select",
+        "options": [
+            {"value": 2048, "label": "2048"},
+            {"value": 4096, "label": "4096"},
+            {"value": 8192, "label": "8192"},
+        ],
+        "default": 4096,
+        "tooltip": "Resolution of the baked PBR texture atlas (base color, roughness, metallic).",
+    },
+    {
+        "id":      "seed",
+        "label":   "Seed",
+        "type":    "int",
+        "default": 42,
+        "min":     0,
+        "max":     2147483647,
+        "tooltip": "Seed for reproducibility. Click shuffle for a random seed.",
+    },
+]
+
+
+@dataclass(frozen=True)
+class CapabilityConfig:
+    node_id: str
+    capability_id: str
+    display_name: str
+    download_check: str
+    input_kind: str
+    output_kind: str
+    params_schema: list[dict]
+
+
+CAPABILITIES: dict[str, CapabilityConfig] = {
+    "generate": CapabilityConfig(
+        node_id="generate",
+        capability_id="image-to-mesh",
+        display_name="Image to Mesh",
+        download_check="pipeline.json",
+        input_kind="image",
+        output_kind="mesh",
+        params_schema=IMAGE_TO_MESH_PARAMS_SCHEMA,
+    ),
+}
 
 
 def filtered_vendor_paths() -> list[str]:
@@ -69,7 +168,7 @@ class Trellis2Generator(BaseGenerator):
     # ------------------------------------------------------------------ #
 
     def is_downloaded(self) -> bool:
-        return (self.model_dir / "pipeline.json").exists()
+        return (self.model_dir / self._capability().download_check).exists()
 
     def load(self) -> None:
         if self._model is not None:
@@ -81,10 +180,11 @@ class Trellis2Generator(BaseGenerator):
         self._setup_env()    # must run before vendor imports so SPARSE_CONV_BACKEND is set
         self._setup_vendor()
 
-        from trellis2.pipelines import Trellis2ImageTo3DPipeline
+        capability = self._capability()
+        pipeline_cls = self._resolve_pipeline_class(capability)
 
-        print(f"[Trellis2Generator] Loading model from {self.model_dir}...")
-        pipe = Trellis2ImageTo3DPipeline.from_pretrained(str(self.model_dir))
+        print(f"[Trellis2Generator] Loading {capability.capability_id} model from {self.model_dir}...")
+        pipe = pipeline_cls.from_pretrained(str(self.model_dir))
         pipe.cuda()
 
         self._model = pipe
@@ -104,91 +204,10 @@ class Trellis2Generator(BaseGenerator):
         progress_cb: Optional[Callable[[int, str], None]] = None,
         cancel_event: Optional[threading.Event] = None,
     ) -> Path:
-        import o_voxel
-
-        pipeline_type = params.get("pipeline_type", "1024_cascade")
-        sparse_steps  = int(params.get("sparse_steps", 12))
-        shape_steps   = int(params.get("shape_steps", 12))
-        tex_steps     = int(params.get("tex_steps", 12))
-        seed          = int(params.get("seed", 42))
-        faces         = int(params.get("faces", -1))
-        texture_size  = int(params.get("texture_size", 4096))
-
-        target_faces = faces if faces > 0 else 1_000_000
-
-        # Load image
-        self._report(progress_cb, 5, "Loading image...")
-        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        self._check_cancelled(cancel_event)
-
-        # Forward pass (three-stage diffusion)
-        self._report(progress_cb, 10, "Generating 3D structure...")
-
-        stop_evt = threading.Event()
-        if progress_cb:
-            t = threading.Thread(
-                target=smooth_progress,
-                args=(progress_cb, 10, 85, "Generating 3D structure...", stop_evt, 5.0),
-                daemon=True,
-            )
-            t.start()
-
-        try:
-            outputs = self._model.run(
-                image,
-                seed=seed,
-                preprocess_image=True,
-                pipeline_type=pipeline_type,
-                sparse_structure_sampler_params={"steps": sparse_steps},
-                shape_slat_sampler_params={"steps": shape_steps},
-                tex_slat_sampler_params={"steps": tex_steps},
-            )
-        finally:
-            stop_evt.set()
-
-        self._check_cancelled(cancel_event)
-
-        # Simplify mesh (nvdiffrast hard limit: 16,777,216 faces)
-        self._report(progress_cb, 87, "Simplifying mesh...")
-        mesh = outputs[0]
-        mesh.simplify(min(target_faces, 16_777_216))
-
-        self._check_cancelled(cancel_event)
-
-        # Bake PBR textures and export GLB
-        self._report(progress_cb, 93, "Baking textures & exporting GLB...")
-        try:
-            glb = o_voxel.postprocess.to_glb(
-                vertices          = mesh.vertices,
-                faces             = mesh.faces,
-                attr_volume       = mesh.attrs,
-                coords            = mesh.coords,
-                attr_layout       = mesh.layout,
-                voxel_size        = mesh.voxel_size,
-                aabb              = [[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
-                decimation_target = target_faces,
-                texture_size      = texture_size,
-                remesh            = True,
-                remesh_band       = 1,
-                remesh_project    = 0,
-                verbose           = False,
-            )
-        except ModuleNotFoundError as exc:
-            if exc.name in {"nvdiffrec", "nvdiffrec_render"}:
-                raise RuntimeError(
-                    "[Trellis2Generator] Optional renderer dependency 'nvdiffrec' is not installed in the extension venv. "
-                    f"Core setup intentionally skips it by default. Re-run setup with {_OPTIONAL_NVDIFFREC_ENV}=1 "
-                    "if this renderer path is required."
-                ) from exc
-            raise
-
-        self.outputs_dir.mkdir(parents=True, exist_ok=True)
-        name = f"{int(time.time())}_{uuid.uuid4().hex[:8]}.glb"
-        path = self.outputs_dir / name
-        glb.export(str(path), extension_webp=True)
-
-        self._report(progress_cb, 100, "Done")
-        return path
+        capability = self._capability()
+        if capability.capability_id == "image-to-mesh":
+            return self._generate_image_to_mesh(image_bytes, params, progress_cb, cancel_event)
+        raise RuntimeError(f"[Trellis2Generator] Unsupported capability '{capability.capability_id}'.")
 
     # ------------------------------------------------------------------ #
     # Vendor / env setup
@@ -230,7 +249,7 @@ class Trellis2Generator(BaseGenerator):
             )
 
         try:
-            from trellis2.pipelines import Trellis2ImageTo3DPipeline  # noqa: F401
+            self._resolve_pipeline_class(self._capability())
         except ImportError as exc:
             raise RuntimeError(
                 f"[Trellis2Generator] vendor/ is incomplete: {exc}\n"
@@ -271,75 +290,127 @@ class Trellis2Generator(BaseGenerator):
 
     @classmethod
     def params_schema(cls) -> list:
-        return [
-            {
-                "id":      "pipeline_type",
-                "label":   "Resolution",
-                "type":    "select",
-                "options": [
-                    {"value": "512",          "label": "512³  (~3 s)"},
-                    {"value": "1024",         "label": "1024³  (~17 s)"},
-                    {"value": "1024_cascade", "label": "1024³ Cascade (~17 s)"},
-                    {"value": "1536_cascade", "label": "1536³ Cascade (~60 s)"},
-                ],
-                "default": "1024_cascade",
-                "tooltip": "Voxel resolution. Higher = more geometry detail but much slower and more VRAM.",
-            },
-            {
-                "id":      "sparse_steps",
-                "label":   "Sparse Structure Steps",
-                "type":    "int",
-                "default": 12,
-                "min":     1,
-                "max":     50,
-                "tooltip": "Diffusion steps for the sparse structure stage. More steps = better structure.",
-            },
-            {
-                "id":      "shape_steps",
-                "label":   "Shape SLAT Steps",
-                "type":    "int",
-                "default": 12,
-                "min":     1,
-                "max":     50,
-                "tooltip": "Diffusion steps for the shape latent stage. More steps = finer geometry.",
-            },
-            {
-                "id":      "tex_steps",
-                "label":   "Texture SLAT Steps",
-                "type":    "int",
-                "default": 12,
-                "min":     1,
-                "max":     50,
-                "tooltip": "Diffusion steps for the texture latent stage. More steps = sharper textures.",
-            },
-            {
-                "id":      "faces",
-                "label":   "Max Faces",
-                "type":    "int",
-                "default": -1,
-                "min":     -1,
-                "max":     16777216,
-                "tooltip": "Target polygon count after simplification. -1 uses 1,000,000.",
-            },
-            {
-                "id":      "texture_size",
-                "label":   "Texture Size",
-                "type":    "select",
-                "options": [
-                    {"value": 2048, "label": "2048"},
-                    {"value": 4096, "label": "4096"},
-                    {"value": 8192, "label": "8192"},
-                ],
-                "default": 4096,
-                "tooltip": "Resolution of the baked PBR texture atlas (base color, roughness, metallic).",
-            },
-            {
-                "id":      "seed",
-                "label":   "Seed",
-                "type":    "int",
-                "default": 42,
-                "min":     0,
-                "max":     2147483647,
-                "tooltip": "Seed for reproducibility. Click shuffle for a random seed.",
-            },
-        ]
+        return CAPABILITIES["generate"].params_schema
+
+    def _capability(self) -> CapabilityConfig:
+        node_id = getattr(self.model_dir, "name", "")
+        if node_id in CAPABILITIES:
+            return CAPABILITIES[node_id]
+        if self.download_check:
+            for capability in CAPABILITIES.values():
+                if capability.download_check == self.download_check:
+                    return capability
+        return CAPABILITIES["generate"]
+
+    def _resolve_pipeline_class(self, capability: CapabilityConfig):
+        if capability.capability_id == "image-to-mesh":
+            from trellis2.pipelines import Trellis2ImageTo3DPipeline
+            return Trellis2ImageTo3DPipeline
+        raise RuntimeError(f"[Trellis2Generator] No pipeline is configured for '{capability.capability_id}'.")
+
+    def _generate_image_to_mesh(
+        self,
+        image_bytes: bytes,
+        params: dict,
+        progress_cb: Optional[Callable[[int, str], None]] = None,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> Path:
+        import o_voxel
+
+        pipeline_type = params.get("pipeline_type", "1024_cascade")
+        sparse_steps  = int(params.get("sparse_steps", 12))
+        shape_steps   = int(params.get("shape_steps", 12))
+        tex_steps     = int(params.get("tex_steps", 12))
+        seed          = int(params.get("seed", 42))
+        faces         = int(params.get("faces", -1))
+        texture_size  = int(params.get("texture_size", 4096))
+        target_faces  = faces if faces > 0 else 1_000_000
+
+        self._report(progress_cb, 5, "Loading image...")
+        image = self._load_image(image_bytes)
+        self._check_cancelled(cancel_event)
+
+        self._report(progress_cb, 10, "Generating 3D structure...")
+        outputs = self._run_with_smoothed_progress(
+            progress_cb,
+            start=10,
+            end=85,
+            label="Generating 3D structure...",
+            run=lambda: self._model.run(
+                image,
+                seed=seed,
+                preprocess_image=True,
+                pipeline_type=pipeline_type,
+                sparse_structure_sampler_params={"steps": sparse_steps},
+                shape_slat_sampler_params={"steps": shape_steps},
+                tex_slat_sampler_params={"steps": tex_steps},
+            ),
+        )
+        self._check_cancelled(cancel_event)
+
+        self._report(progress_cb, 87, "Simplifying mesh...")
+        mesh = outputs[0]
+        mesh.simplify(min(target_faces, 16_777_216))
+        self._check_cancelled(cancel_event)
+
+        self._report(progress_cb, 93, "Baking textures & exporting GLB...")
+        try:
+            glb = o_voxel.postprocess.to_glb(
+                vertices          = mesh.vertices,
+                faces             = mesh.faces,
+                attr_volume       = mesh.attrs,
+                coords            = mesh.coords,
+                attr_layout       = mesh.layout,
+                voxel_size        = mesh.voxel_size,
+                aabb              = [[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
+                decimation_target = target_faces,
+                texture_size      = texture_size,
+                remesh            = True,
+                remesh_band       = 1,
+                remesh_project    = 0,
+                verbose           = False,
+            )
+        except ModuleNotFoundError as exc:
+            if exc.name in {"nvdiffrec", "nvdiffrec_render"}:
+                raise RuntimeError(
+                    "[Trellis2Generator] Optional renderer dependency 'nvdiffrec' is not installed in the extension venv. "
+                    f"Core setup intentionally skips it by default. Re-run setup with {_OPTIONAL_NVDIFFREC_ENV}=1 "
+                    "if this renderer path is required."
+                ) from exc
+            raise
+
+        output_path = self._next_output_path()
+        glb.export(str(output_path), extension_webp=True)
+        self._report(progress_cb, 100, "Done")
+        return output_path
+
+    def _load_image(self, image_bytes: bytes):
+        return Image.open(io.BytesIO(image_bytes)).convert("RGB")
+
+    def _run_with_smoothed_progress(
+        self,
+        progress_cb: Optional[Callable[[int, str], None]],
+        *,
+        start: int,
+        end: int,
+        label: str,
+        run: Callable[[], object],
+    ):
+        stop_evt = threading.Event()
+        if progress_cb:
+            thread = threading.Thread(
+                target=smooth_progress,
+                args=(progress_cb, start, end, label, stop_evt, 5.0),
+                daemon=True,
+            )
+            thread.start()
+
+        try:
+            return run()
+        finally:
+            stop_evt.set()
+
+    def _next_output_path(self) -> Path:
+        self.outputs_dir.mkdir(parents=True, exist_ok=True)
+        name = f"{int(time.time())}_{uuid.uuid4().hex[:8]}.glb"
+        return self.outputs_dir / name
